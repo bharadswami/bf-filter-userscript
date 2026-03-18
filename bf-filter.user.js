@@ -7,6 +7,8 @@
 // @grant       GM_getValue
 // @grant       GM_setValue
 // @grant       GM_registerMenuCommand
+// @grant       GM_xmlhttpRequest
+// @connect     generativelanguage.googleapis.com
 // @run-at      document-idle
 // ==/UserScript==
 
@@ -19,6 +21,8 @@
     minCharThreshold: 50,
     keywordFilterEnabled: true,
     lengthFilterEnabled: true,
+    aiFilterEnabled: false,
+    aiApiKey: '',
   };
 
   function loadSettings() {
@@ -27,6 +31,8 @@
       minCharThreshold: GM_getValue('minCharThreshold', DEFAULTS.minCharThreshold),
       keywordFilterEnabled: GM_getValue('keywordFilterEnabled', DEFAULTS.keywordFilterEnabled),
       lengthFilterEnabled: GM_getValue('lengthFilterEnabled', DEFAULTS.lengthFilterEnabled),
+      aiFilterEnabled: GM_getValue('aiFilterEnabled', DEFAULTS.aiFilterEnabled),
+      aiApiKey: GM_getValue('aiApiKey', DEFAULTS.aiApiKey),
     };
   }
 
@@ -64,6 +70,21 @@
     GM_setValue('minCharThreshold', settings.minCharThreshold);
     removeAllFilters();
     if (settings.enabled) processAllComments();
+  });
+
+  GM_registerMenuCommand('Toggle AI filter', () => {
+    settings.aiFilterEnabled = !settings.aiFilterEnabled;
+    GM_setValue('aiFilterEnabled', settings.aiFilterEnabled);
+    alert(`AI filter: ${settings.aiFilterEnabled ? 'ON' : 'OFF'}`);
+    removeAllFilters();
+    if (settings.enabled) processAllComments();
+  });
+
+  GM_registerMenuCommand('Set Gemini API key', () => {
+    const key = prompt('Gemini API key:', settings.aiApiKey);
+    if (key === null) return;
+    settings.aiApiKey = key.trim();
+    GM_setValue('aiApiKey', settings.aiApiKey);
   });
 
   // ── Constants ─────────────────────────────────────────────────────────
@@ -113,6 +134,133 @@
 
   function normalize(text) {
     return text.trim().toLowerCase().replace(/[!?.,:;]+$/, '').trim();
+  }
+
+  // ── AI filter ────────────────────────────────────────────────────────
+  const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent';
+  const AI_MAX_CHAR_LENGTH = 500;
+  const MAX_PROMPT_TEXT_LENGTH = 300;
+  const MAX_CACHE_ENTRIES = 500;
+  const SESSION_CACHE_KEY = 'bf-filter-ai-cache';
+
+  const SYSTEM_PROMPT = `You are a forum comment quality classifier for a startup community. Classify each numbered comment as LOW or HIGH value.
+
+LOW-VALUE: congratulatory fluff, one-word reactions, emoji-only, generic encouragement, memes/jokes with no info, repetitive agreement
+HIGH-VALUE: substantive feedback/advice/critique, questions that drive discussion, personal experience/data, counterarguments, specific suggestions, links/resources
+
+Return ONLY a JSON array of objects, one per comment, in order:
+[{"id": 1, "low": true, "reason": "brief reason"}, ...]`;
+
+  function loadAiCache() {
+    try {
+      const raw = localStorage.getItem(SESSION_CACHE_KEY);
+      if (!raw) return new Map();
+      return new Map(JSON.parse(raw));
+    } catch { return new Map(); }
+  }
+
+  function saveAiCache(cache) {
+    try {
+      localStorage.setItem(
+        SESSION_CACHE_KEY,
+        JSON.stringify(Array.from(cache.entries()).slice(-MAX_CACHE_ENTRIES))
+      );
+    } catch { /* localStorage full or unavailable */ }
+  }
+
+  const aiCache = loadAiCache();
+
+  function aiCacheKey(text) { return text.trim().toLowerCase(); }
+
+  function truncate(text) {
+    return text.length > MAX_PROMPT_TEXT_LENGTH
+      ? text.slice(0, MAX_PROMPT_TEXT_LENGTH) + '...'
+      : text;
+  }
+
+  function gmFetch(url, apiKey, body) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: `${url}?key=${apiKey}`,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify(body),
+        onload: (res) => {
+          if (res.status >= 200 && res.status < 300) {
+            resolve(JSON.parse(res.responseText));
+          } else {
+            reject(new Error(`Gemini API ${res.status}: ${res.responseText}`));
+          }
+        },
+        onerror: (err) => reject(err),
+      });
+    });
+  }
+
+  /**
+   * Classify a batch of comment texts via Gemini.
+   * Returns a Map from original text to { filtered, reason }.
+   */
+  async function aiClassifyBatch(texts) {
+    const results = new Map();
+    if (!settings.aiFilterEnabled || !settings.aiApiKey || texts.length === 0) return results;
+
+    // Split into cached and uncached
+    const uncachedMap = new Map();
+    for (const text of texts) {
+      const key = aiCacheKey(text);
+      const cached = aiCache.get(key);
+      if (cached !== undefined) {
+        results.set(text, cached);
+      } else if (!uncachedMap.has(key)) {
+        uncachedMap.set(key, text);
+      }
+    }
+
+    const uncachedTexts = Array.from(uncachedMap.values());
+    if (uncachedTexts.length === 0) return results;
+
+    const numbered = uncachedTexts.map((t, i) => `${i + 1}. "${truncate(t)}"`).join('\n');
+
+    try {
+      const data = await gmFetch(GEMINI_API_URL, settings.aiApiKey, {
+        system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        contents: [{ parts: [{ text: `Comments:\n\n${numbered}` }] }],
+      });
+
+      const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const jsonMatch = content.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) {
+        console.warn('[BF Filter] AI response missing JSON array');
+        return results;
+      }
+
+      const classifications = JSON.parse(jsonMatch[0]);
+      for (const item of classifications) {
+        const idx = item.id - 1;
+        if (idx < 0 || idx >= uncachedTexts.length) continue;
+        const text = uncachedTexts[idx];
+        const result = item.low
+          ? { filtered: true, reason: `AI: ${item.reason || 'low-value'}` }
+          : { filtered: false };
+        aiCache.set(aiCacheKey(text), result);
+        results.set(text, result);
+      }
+
+      // Default unclassified to not-filtered
+      for (const text of uncachedTexts) {
+        if (!results.has(text)) {
+          aiCache.set(aiCacheKey(text), { filtered: false });
+          results.set(text, { filtered: false });
+        }
+      }
+
+      saveAiCache(aiCache);
+    } catch (err) {
+      console.warn('[BF Filter] AI batch failed:', err);
+    }
+
+    return results;
   }
 
   // ── Filter logic ──────────────────────────────────────────────────────
@@ -252,23 +400,7 @@
   }
 
   // ── Main processing ───────────────────────────────────────────────────
-  function processAllComments() {
-    if (!settings.enabled) return;
-    if (!POST_PATH_RE.test(location.pathname)) return;
-
-    const comments = document.querySelectorAll(COMMENT_SEL);
-    const filtered = [];
-
-    // Phase 1: classify all comments
-    for (const comment of comments) {
-      const reason = classifyComment(comment);
-      if (reason) {
-        comment.setAttribute('data-bf-filtered', reason);
-        filtered.push(comment);
-      }
-    }
-
-    // Phase 2: apply thread-context preservation, then hide
+  function applyFiltersAndHide(filtered) {
     let hiddenCount = 0;
     for (const comment of filtered) {
       const li = comment.closest('li');
@@ -283,8 +415,51 @@
       hideComment(comment, comment.getAttribute('data-bf-filtered'));
       hiddenCount++;
     }
+    return hiddenCount;
+  }
 
+  async function processAllComments() {
+    if (!settings.enabled) return;
+    if (!POST_PATH_RE.test(location.pathname)) return;
+
+    const comments = document.querySelectorAll(COMMENT_SEL);
+    const filtered = [];
+    const aiQueue = []; // { element, text }
+
+    // Phase 1: cheap filters (length + keyword)
+    for (const comment of comments) {
+      const reason = classifyComment(comment);
+      if (reason) {
+        comment.setAttribute('data-bf-filtered', reason);
+        filtered.push(comment);
+      } else if (settings.aiFilterEnabled && settings.aiApiKey) {
+        const text = getCommentText(comment);
+        if (text && text.length <= AI_MAX_CHAR_LENGTH && !isStaff(comment)) {
+          aiQueue.push({ element: comment, text });
+        }
+      }
+    }
+
+    // Phase 2: apply cheap filters immediately
+    let hiddenCount = applyFiltersAndHide(filtered);
     if (hiddenCount > 0) createOrUpdateSummary(hiddenCount);
+
+    // Phase 3: AI classification (async, batch)
+    if (aiQueue.length > 0) {
+      const aiResults = await aiClassifyBatch(aiQueue.map((q) => q.text));
+      const aiFiltered = [];
+      for (const { element, text } of aiQueue) {
+        const result = aiResults.get(text);
+        if (result && result.filtered) {
+          element.setAttribute('data-bf-filtered', result.reason);
+          aiFiltered.push(element);
+        }
+      }
+      if (aiFiltered.length > 0) {
+        hiddenCount += applyFiltersAndHide(aiFiltered);
+        createOrUpdateSummary(hiddenCount);
+      }
+    }
   }
 
   // ── Mutation observer for dynamic comments ────────────────────────────
