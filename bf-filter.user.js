@@ -351,7 +351,18 @@ Return ONLY a JSON array of objects, one per comment, in order:
   }
 
   // ── Summary bar ───────────────────────────────────────────────────────
-  function createOrUpdateSummary(count) {
+  function getFilteredCount() {
+    return document.querySelectorAll('[data-bf-filtered]').length;
+  }
+
+  function updateSummaryText(bar, revealed) {
+    const count = getFilteredCount();
+    bar.textContent = revealed
+      ? `Hide ${count} filtered comment${count === 1 ? '' : 's'}`
+      : `Show ${count} filtered comment${count === 1 ? '' : 's'}`;
+  }
+
+  function createOrUpdateSummary() {
     const ol = document.querySelector(`ol:has(${COMMENT_SEL})`);
     if (!ol) return;
 
@@ -389,19 +400,16 @@ Return ONLY a JSON array of objects, one per comment, in order:
             li.style.borderLeft = '';
           }
         });
-        bar.textContent = revealed
-          ? `Hide ${count} filtered comments`
-          : `Show ${count} filtered comments`;
+        updateSummaryText(bar, revealed);
         requestAnimationFrame(() => { suppressObserver = false; });
       });
       ol.parentNode.insertBefore(bar, ol);
     }
-    bar.textContent = `Show ${count} filtered comments`;
+    updateSummaryText(bar, false);
   }
 
   // ── Main processing ───────────────────────────────────────────────────
   function applyFiltersAndHide(filtered) {
-    let hiddenCount = 0;
     for (const comment of filtered) {
       const li = comment.closest('li');
       if (li && hasValuableReplies(li)) {
@@ -413,16 +421,22 @@ Return ONLY a JSON array of objects, one per comment, in order:
         continue;
       }
       hideComment(comment, comment.getAttribute('data-bf-filtered'));
-      hiddenCount++;
     }
-    return hiddenCount;
   }
 
   async function processAllComments() {
     if (!settings.enabled) return;
     if (!POST_PATH_RE.test(location.pathname)) return;
 
-    const comments = document.querySelectorAll(COMMENT_SEL);
+    const allComments = document.querySelectorAll(COMMENT_SEL);
+    // Bookface renders duplicate comment nodes; deduplicate by ID
+    const seen = new Set();
+    const comments = [];
+    for (const c of allComments) {
+      if (c.id && seen.has(c.id)) continue;
+      if (c.id) seen.add(c.id);
+      comments.push(c);
+    }
     const filtered = [];
     const aiQueue = []; // { element, text }
 
@@ -441,8 +455,8 @@ Return ONLY a JSON array of objects, one per comment, in order:
     }
 
     // Phase 2: apply cheap filters immediately
-    let hiddenCount = applyFiltersAndHide(filtered);
-    if (hiddenCount > 0) createOrUpdateSummary(hiddenCount);
+    applyFiltersAndHide(filtered);
+    if (getFilteredCount() > 0) createOrUpdateSummary();
 
     // Phase 3: AI classification (async, batch)
     if (aiQueue.length > 0) {
@@ -456,8 +470,8 @@ Return ONLY a JSON array of objects, one per comment, in order:
         }
       }
       if (aiFiltered.length > 0) {
-        hiddenCount += applyFiltersAndHide(aiFiltered);
-        createOrUpdateSummary(hiddenCount);
+        applyFiltersAndHide(aiFiltered);
+        createOrUpdateSummary();
       }
     }
   }
