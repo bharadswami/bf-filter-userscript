@@ -3,7 +3,7 @@
 // @namespace   bf-filter
 // @description Filters low-value comments on YC Bookface. Hides "congrats!", "+1", "W", and other fluff.
 // @match       https://bookface.ycombinator.com/*
-// @version     1.0.1
+// @version     1.0.2
 // @grant       GM_getValue
 // @grant       GM_setValue
 // @grant       GM_registerMenuCommand
@@ -419,28 +419,38 @@ Return ONLY a JSON array of objects, one per comment, in order:
   }
 
   // ── Thread context preservation ───────────────────────────────────────
-  function hasValuableReplies(commentLi) {
-    const childComments = commentLi.querySelectorAll(
-      `:scope > ol ${COMMENT_SEL}`,
-    );
-    for (const child of childComments) {
-      if (isStaff(child)) return true;
-      if (!child.hasAttribute("data-bf-filtered")) return true;
+  function getParentComment(comment, commentByLi) {
+    let parentLi = comment.closest("li")?.parentElement?.closest("li");
+    while (parentLi) {
+      const parentComment = commentByLi.get(parentLi);
+      if (parentComment) return parentComment;
+      parentLi = parentLi.parentElement?.closest("li");
     }
-    return false;
+    return null;
   }
 
-  function hasValuableAncestor(commentEl) {
-    let li = commentEl.closest("li");
-    while (li) {
-      const parentLi = li.parentElement?.closest("li");
-      if (!parentLi) break;
-      const parentComment = parentLi.querySelector(`:scope > ${COMMENT_SEL}`);
-      if (parentComment && !parentComment.hasAttribute("data-bf-filtered"))
-        return true;
-      li = parentLi;
+  /**
+   * A useful comment protects its complete ancestor chain so the discussion
+   * remains readable. Low-value siblings are not protected.
+   */
+  function getContextComments(comments, filterReasons) {
+    const commentByLi = new Map();
+    for (const comment of comments) {
+      const li = comment.closest("li");
+      if (li) commentByLi.set(li, comment);
     }
-    return false;
+
+    const contextComments = new Set();
+    for (const comment of comments) {
+      if (filterReasons.get(comment)) continue;
+
+      let current = comment;
+      while (current && !contextComments.has(current)) {
+        contextComments.add(current);
+        current = getParentComment(current, commentByLi);
+      }
+    }
+    return contextComments;
   }
 
   // ── DOM manipulation ──────────────────────────────────────────────────
@@ -448,8 +458,18 @@ Return ONLY a JSON array of objects, one per comment, in order:
     const li = commentEl.closest("li");
     if (!li) return;
     commentEl.setAttribute("data-bf-filtered", reason);
-    li.setAttribute("data-bf-original-display", li.style.display || "");
+    if (!li.hasAttribute("data-bf-original-display")) {
+      li.setAttribute("data-bf-original-display", li.style.display || "");
+    }
     li.style.display = "none";
+  }
+
+  function ensureCommentVisible(commentEl) {
+    const li = commentEl.closest("li");
+    commentEl.removeAttribute("data-bf-filtered");
+    if (!li || !li.hasAttribute("data-bf-original-display")) return;
+    li.style.display = li.getAttribute("data-bf-original-display") || "";
+    li.removeAttribute("data-bf-original-display");
   }
 
   function showComment(commentEl) {
@@ -536,18 +556,16 @@ Return ONLY a JSON array of objects, one per comment, in order:
   }
 
   // ── Main processing ───────────────────────────────────────────────────
-  function applyFiltersAndHide(filtered) {
-    for (const comment of filtered) {
-      const li = comment.closest("li");
-      if (li && hasValuableReplies(li)) {
-        comment.removeAttribute("data-bf-filtered");
-        continue;
+  function applyThreadFilters(comments, filterReasons) {
+    const contextComments = getContextComments(comments, filterReasons);
+
+    for (const comment of comments) {
+      const reason = filterReasons.get(comment);
+      if (!reason || contextComments.has(comment)) {
+        ensureCommentVisible(comment);
+      } else {
+        hideComment(comment, reason);
       }
-      if (hasValuableAncestor(comment)) {
-        comment.removeAttribute("data-bf-filtered");
-        continue;
-      }
-      hideComment(comment, comment.getAttribute("data-bf-filtered"));
     }
   }
 
@@ -564,43 +582,42 @@ Return ONLY a JSON array of objects, one per comment, in order:
       if (c.id) seen.add(c.id);
       comments.push(c);
     }
-    const filtered = [];
+    const filterReasons = new Map();
     const aiQueue = []; // { element, text }
 
-    // Phase 1: cheap filters (length + keyword)
+    // Phase 1: classify every comment without changing the DOM.
     for (const comment of comments) {
       const reason = classifyComment(comment);
       if (reason) {
-        comment.setAttribute("data-bf-filtered", reason);
-        filtered.push(comment);
+        filterReasons.set(comment, reason);
       } else if (settings.aiFilterEnabled && settings.openRouterApiKey) {
         const text = getCommentText(comment);
         if (text && text.length <= AI_MAX_CHAR_LENGTH && !isStaff(comment)) {
           aiQueue.push({ element: comment, text });
+        } else {
+          filterReasons.set(comment, null);
         }
+      } else {
+        filterReasons.set(comment, null);
       }
     }
 
-    // Phase 2: apply cheap filters immediately
-    applyFiltersAndHide(filtered);
-    if (getFilteredCount() > 0) createOrUpdateSummary();
-
-    // Phase 3: AI classification (async, batch)
+    // Phase 2: finish AI classifications before evaluating thread context.
     if (aiQueue.length > 0) {
       const aiResults = await aiClassifyBatch(aiQueue.map((q) => q.text));
-      const aiFiltered = [];
       for (const { element, text } of aiQueue) {
         const result = aiResults.get(text);
-        if (result && result.filtered) {
-          element.setAttribute("data-bf-filtered", result.reason);
-          aiFiltered.push(element);
-        }
-      }
-      if (aiFiltered.length > 0) {
-        applyFiltersAndHide(aiFiltered);
-        createOrUpdateSummary();
+        filterReasons.set(
+          element,
+          result?.filtered ? result.reason : null,
+        );
       }
     }
+
+    // Phase 3: every useful comment protects its ancestors. Low-value sibling
+    // branches are still hidden because they are not part of that context path.
+    applyThreadFilters(comments, filterReasons);
+    if (getFilteredCount() > 0) createOrUpdateSummary();
   }
 
   // ── Mutation observer for dynamic comments ────────────────────────────

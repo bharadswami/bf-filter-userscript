@@ -21,7 +21,7 @@ Three filter layers run in order:
 | **AI** (opt-in) | Off                 | Remaining low-value comments via OpenRouter |
 
 - YC staff comments are **never** filtered
-- Thread context is preserved -- a low-value comment stays visible if it has substantive replies
+- Thread context is preserved -- a substantive reply keeps its complete ancestor chain visible, while low-value sibling branches are still filtered
 - Filtered comments can be toggled visible via the summary bar
 
 ## AI filter setup
