@@ -3,12 +3,12 @@
 // @namespace   bf-filter
 // @description Filters low-value comments on YC Bookface. Hides "congrats!", "+1", "W", and other fluff.
 // @match       https://bookface.ycombinator.com/*
-// @version     1.0.0
+// @version     1.0.1
 // @grant       GM_getValue
 // @grant       GM_setValue
 // @grant       GM_registerMenuCommand
 // @grant       GM_xmlhttpRequest
-// @connect     generativelanguage.googleapis.com
+// @connect     openrouter.ai
 // @updateURL   https://raw.githubusercontent.com/bharadswami/bf-filter-userscript/main/bf-filter.user.js
 // @downloadURL https://raw.githubusercontent.com/bharadswami/bf-filter-userscript/main/bf-filter.user.js
 // @run-at      document-idle
@@ -24,7 +24,7 @@
     keywordFilterEnabled: true,
     lengthFilterEnabled: true,
     aiFilterEnabled: false,
-    aiApiKey: "",
+    openRouterApiKey: "",
   };
 
   function loadSettings() {
@@ -43,7 +43,10 @@
         DEFAULTS.lengthFilterEnabled,
       ),
       aiFilterEnabled: GM_getValue("aiFilterEnabled", DEFAULTS.aiFilterEnabled),
-      aiApiKey: GM_getValue("aiApiKey", DEFAULTS.aiApiKey),
+      openRouterApiKey: GM_getValue(
+        "openRouterApiKey",
+        DEFAULTS.openRouterApiKey,
+      ),
     };
   }
 
@@ -95,11 +98,11 @@
     if (settings.enabled) processAllComments();
   });
 
-  GM_registerMenuCommand("Set Gemini API key", () => {
-    const key = prompt("Gemini API key:", settings.aiApiKey);
+  GM_registerMenuCommand("Set OpenRouter API key", () => {
+    const key = prompt("OpenRouter API key:", settings.openRouterApiKey);
     if (key === null) return;
-    settings.aiApiKey = key.trim();
-    GM_setValue("aiApiKey", settings.aiApiKey);
+    settings.openRouterApiKey = key.trim();
+    GM_setValue("openRouterApiKey", settings.openRouterApiKey);
   });
 
   // ── Constants ─────────────────────────────────────────────────────────
@@ -218,8 +221,12 @@
   }
 
   // ── AI filter ────────────────────────────────────────────────────────
-  const GEMINI_API_URL =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent";
+  const OPENROUTER_API_URL =
+    "https://openrouter.ai/api/v1/chat/completions";
+  const OPENROUTER_MODELS = [
+    "google/gemma-4-31b-it",
+    "qwen/qwen3.6-35b-a3b",
+  ];
   const AI_MAX_CHAR_LENGTH = 500;
   const MAX_PROMPT_TEXT_LENGTH = 300;
   const MAX_CACHE_ENTRIES = 500;
@@ -266,18 +273,25 @@ Return ONLY a JSON array of objects, one per comment, in order:
       : text;
   }
 
-  function gmFetch(url, apiKey, body) {
+  function openRouterFetch(body) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: "POST",
-        url: `${url}?key=${apiKey}`,
-        headers: { "Content-Type": "application/json" },
+        url: OPENROUTER_API_URL,
+        headers: {
+          Authorization: `Bearer ${settings.openRouterApiKey}`,
+          "HTTP-Referer": location.origin,
+          "X-OpenRouter-Title": "BF Filter",
+          "Content-Type": "application/json",
+        },
         data: JSON.stringify(body),
         onload: (res) => {
           if (res.status >= 200 && res.status < 300) {
             resolve(JSON.parse(res.responseText));
           } else {
-            reject(new Error(`Gemini API ${res.status}: ${res.responseText}`));
+            reject(
+              new Error(`OpenRouter API ${res.status}: ${res.responseText}`),
+            );
           }
         },
         onerror: (err) => reject(err),
@@ -286,12 +300,16 @@ Return ONLY a JSON array of objects, one per comment, in order:
   }
 
   /**
-   * Classify a batch of comment texts via Gemini.
+   * Classify a batch of comment texts via OpenRouter.
    * Returns a Map from original text to { filtered, reason }.
    */
   async function aiClassifyBatch(texts) {
     const results = new Map();
-    if (!settings.aiFilterEnabled || !settings.aiApiKey || texts.length === 0)
+    if (
+      !settings.aiFilterEnabled ||
+      !settings.openRouterApiKey ||
+      texts.length === 0
+    )
       return results;
 
     // Split into cached and uncached
@@ -314,12 +332,20 @@ Return ONLY a JSON array of objects, one per comment, in order:
       .join("\n");
 
     try {
-      const data = await gmFetch(GEMINI_API_URL, settings.aiApiKey, {
-        system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: [{ parts: [{ text: `Comments:\n\n${numbered}` }] }],
+      const data = await openRouterFetch({
+        models: OPENROUTER_MODELS,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: `Comments:\n\n${numbered}` },
+        ],
+        provider: {
+          sort: { by: "latency", partition: "none" },
+          zdr: true,
+          data_collection: "deny",
+        },
       });
 
-      const content = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const content = data.choices?.[0]?.message?.content || "";
       const jsonMatch = content.match(/\[[\s\S]*\]/);
       if (!jsonMatch) {
         console.warn("[BF Filter] AI response missing JSON array");
@@ -547,7 +573,7 @@ Return ONLY a JSON array of objects, one per comment, in order:
       if (reason) {
         comment.setAttribute("data-bf-filtered", reason);
         filtered.push(comment);
-      } else if (settings.aiFilterEnabled && settings.aiApiKey) {
+      } else if (settings.aiFilterEnabled && settings.openRouterApiKey) {
         const text = getCommentText(comment);
         if (text && text.length <= AI_MAX_CHAR_LENGTH && !isStaff(comment)) {
           aiQueue.push({ element: comment, text });
